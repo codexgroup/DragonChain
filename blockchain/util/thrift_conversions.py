@@ -33,8 +33,12 @@ __email__ = "joe@dragonchain.org"
 
 import blockchain.gen.messaging.ttypes as message_types
 
+RECORD = 'record'
+VERIFICATION_RECORD = 'verification_record'
+VERIFICATION_INFO = 'verification_info'
 
-# functions below used for converting thrift types to some other structure #
+
+# **** functions below used for converting thrift types to some other structure **** #
 def thrift_record_to_dict(thrift_record):
     """ returns a dictionary representation of a thrift verification_record """
     return {
@@ -42,13 +46,15 @@ def thrift_record_to_dict(thrift_record):
         'origin_id': thrift_record.origin_id,
         'phase': thrift_record.phase,
         'verification_ts': thrift_record.verification_ts,
+        'verification_id': None,
         'signature': convert_thrift_signature(thrift_record.signature),
         'prior_hash': thrift_record.prior_hash,
-        'lower_phase_hash': thrift_record.lower_phase_hash
+        'lower_hash': thrift_record.lower_hash,
+        'public_transmission': thrift_record.public_transmission
     }
 
 
-def thrift_transaction_to_dict(thrift_transaction):
+def convert_thrift_transaction(thrift_transaction):
     """ returns a dictionary representation of a thrift transaction """
     payload = thrift_transaction.tx_payload
     return {
@@ -89,7 +95,7 @@ def convert_thrift_signature(thrift_signature):
     }
 
 
-# functions below used for converting to thrift types #
+# **** functions below used for converting to thrift types **** #
 def convert_to_thrift_transaction(transaction):
     """ returns a thrift representation of a transactions converted from a dictionary """
     thrift_transaction = message_types.Transaction()
@@ -119,33 +125,38 @@ def convert_to_thrift_header(tx_header):
     return thrift_header
 
 
-def convert_to_thrift_signature(tx_signature):
-    """ returns a thrift representation of a dictionary transaction signature """
+def convert_to_thrift_signature(signature):
+    """ returns a thrift representation of a dictionary signature """
     thrift_signature = message_types.Signature()
-    if "signatory" in tx_signature:
-        thrift_signature.signatory = str(tx_signature['signatory'])
+    if "signatory" in signature:
+        thrift_signature.signatory = str(signature['signatory'])
 
-    if "signature_ts" in tx_signature:
-        thrift_signature.signature_ts = tx_signature['signature_ts']
+    if "signature_ts" in signature:
+        thrift_signature.signature_ts = signature['signature_ts']
 
-    if "stripped_hash" in tx_signature:
-        thrift_signature.strip_hash = tx_signature['stripped_hash']
+    if "stripped_hash" in signature:
+        thrift_signature.strip_hash = signature['stripped_hash']
 
-    thrift_signature.hash = tx_signature['hash']
-    thrift_signature.signature = tx_signature['signature']
-    thrift_signature.public_key = tx_signature['public_key']
+    thrift_signature.hash = signature['hash']
+    thrift_signature.signature = signature['signature']
+    thrift_signature.public_key = signature['public_key']
 
     return thrift_signature
 
 
-def get_verification_record(record):
-    """ returns a thrift representation of a dictionary verification record """
+def convert_to_thrift_record(record):
+    """ returns a thrift representation of a dictionary VerificationRecordCommonInfo """
+    verification_id = None
+    if 'verification_id' in record:
+        verification_id = record['verification_id']
     thrift_record = message_types.VerificationRecordCommonInfo()
     thrift_record.block_id = record['block_id']
     thrift_record.origin_id = record['origin_id']
     thrift_record.phase = record['phase']
     thrift_record.verification_ts = record['verification_ts']
-    thrift_record.lower_phase_hash = record['lower_phase_hash']
+    thrift_record.verification_id = verification_id
+    thrift_record.lower_hash = record['lower_hash']
+    thrift_record.public_transmission = record['public_transmission']
 
     if record['prior_hash']:
         thrift_record.prior_hash = record['prior_hash']
@@ -153,3 +164,167 @@ def get_verification_record(record):
     thrift_record.signature = convert_to_thrift_signature(record['signature'])
 
     return thrift_record
+
+
+def get_phase_1_info(phase_1):
+    """ return dictionary representation of thrift phase 1 """
+    return {
+        RECORD: thrift_record_to_dict(phase_1.record),
+        VERIFICATION_INFO: map(convert_thrift_transaction, phase_1.transactions)
+    }
+
+
+def get_phase_2_info(phase_2):
+    """ return dictionary representation of thrift phase 2 """
+    return {
+        RECORD: thrift_record_to_dict(phase_2.record),
+        VERIFICATION_INFO: {
+            'valid_txs': map(convert_thrift_transaction, phase_2.valid_txs),
+            'invalid_txs': map(convert_thrift_transaction, phase_2.invalid_txs),
+            'business': phase_2.business,
+            'deploy_location': phase_2.deploy_location
+        }
+    }
+
+
+def get_phase_3_info(phase_3):
+    """ return dictionary representation of thrift phase 3 """
+    return {
+        RECORD: thrift_record_to_dict(phase_3.record),
+        VERIFICATION_INFO: {
+            'lower_hashes': phase_3.lower_hashes,
+            'p2_count': phase_3.p2_count,
+            'businesses': phase_3.businesses,
+            'deploy_locations': phase_3.deploy_locations
+        }
+    }
+
+
+def get_phase_4_info(phase_4):
+    """ return dictionary representation of thrift phase 4 """
+    return {
+        RECORD: thrift_record_to_dict(phase_4.record),
+        VERIFICATION_INFO: phase_4.lower_hash
+    }
+
+
+def get_p1_message(block_info):
+    """ returns thrift phase 1 message structure """
+    verification_record = block_info['verification_record']
+    transactions = map(convert_to_thrift_transaction, verification_record['verification_info'])
+    verification_record = convert_to_thrift_record(verification_record)
+
+    phase_1_msg = message_types.Phase_1_msg()
+    phase_1_msg.record = verification_record
+    phase_1_msg.transactions = transactions
+
+    return phase_1_msg
+
+
+def get_p2_message(block_info):
+    """returns thrift phase 2 message structure """
+    verification_record = block_info['verification_record']
+    verification_info = verification_record['verification_info']
+
+    phase_2_msg = message_types.Phase_2_msg()
+    phase_2_msg.record = convert_to_thrift_record(verification_record)
+    phase_2_msg.valid_txs = map(convert_to_thrift_transaction, verification_info['valid_txs'])
+    phase_2_msg.invalid_txs = map(convert_to_thrift_transaction, verification_info['invalid_txs'])
+    phase_2_msg.business = verification_info['business']
+    phase_2_msg.deploy_location = verification_info['deploy_location']
+
+    return phase_2_msg
+
+
+def get_p3_message(block_info):
+    """returns thrift phase 3 message structure """
+    verification_record = block_info['verification_record']
+    verification_info = verification_record['verification_info']
+
+    phase_3_msg = message_types.Phase_3_msg()
+    phase_3_msg.record = convert_to_thrift_record(verification_record)
+    phase_3_msg.p2_count = verification_info['p2_count']
+    phase_3_msg.businesses = verification_info['businesses']
+    phase_3_msg.deploy_locations = verification_info['deploy_locations']
+    phase_3_msg.lower_hashes = verification_info['lower_hashes']
+
+    return phase_3_msg
+
+
+def get_p4_message(block_info):
+    """returns thrift phase 4 message structure """
+    verification_record = block_info['verification_record']
+
+    phase_4_msg = message_types.Phase_4_msg()
+    phase_4_msg.record = convert_to_thrift_record(verification_record)
+    phase_4_msg.lower_hash = block_info['verification_record']['lower_hash']
+
+    return phase_4_msg
+
+
+def get_verification_type(verification):
+    """ construct a thrift friendly verification record for broadcast receipt """
+    record = {'block_id': verification['block_id'],
+              'origin_id': verification['origin_id'],
+              'phase': verification['phase'],
+              'verification_ts': verification['verification_ts'],
+              'verification_id': verification['verification_id'],
+              'lower_hash': None,
+              'prior_hash': None,
+              'public_transmission': None,
+              'signature': verification['signature'],
+              'verification_info': verification['verification_info']
+              }
+    info = {'verification_record': record}
+    phase = verification['phase']
+    verification_record = message_types.VerificationRecord()
+
+    if phase == 1:
+        verification_record.p1 = get_p1_message(info)
+    elif phase == 2:
+        verification_record.p2 = get_p2_message(info)
+    elif phase == 3:
+        verification_record.p3 = get_p3_message(info)
+    elif phase == 4:
+        verification_record.p4 = get_p4_message(info)
+
+    return verification_record
+
+
+def convert_thrift_verification(verification):
+    """ convert thrift verification record to dict """
+    record = None
+    verification_info = None
+    if verification.p1:
+        record = verification.p1.record
+        verification_info = map(convert_thrift_transaction, verification.p1.transactions)
+    elif verification.p2:
+        record = verification.p2.record
+        verification_info = {'valid_txs': map(convert_thrift_transaction, verification.p2.valid_txs),
+                             'invalid_txs': map(convert_thrift_transaction, verification.p2.invalid_txs),
+                             'business': verification.p2.business,
+                             'deploy_location': verification.p2.deploy_location
+                             }
+    elif verification.p3:
+        record = verification.p3.record
+        verification_info = {'lower_hashes': verification.p3.lower_hashes,
+                             'p2_count': verification.p3.p2_count,
+                             'businesses': verification.p3.businesses,
+                             'deploy_locations': verification.p3.deploy_locations
+                             }
+    elif verification.p4:
+        record = verification.p4.record
+
+    verification_record = {'block_id': record.block_id,
+                           'origin_id': record.origin_id,
+                           'phase': record.phase,
+                           'verification_ts': record.verification_ts,
+                           'verification_id': record.verification_id,
+                           'lower_hash': None,
+                           'prior_hash': None,
+                           'public_transmission': None,
+                           'signature': convert_thrift_signature(record.signature),
+                           'verification_info': verification_info
+                           }
+
+    return verification_record

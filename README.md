@@ -24,8 +24,9 @@ Group blockchain standardization​)
 
 ## Quick Links
 * [Dragonchain Organization](https://dragonchain.github.io/)
-* [Dragonchain Architecture Document](https://dragonchain.github.io/doc/DragonchainArchitecture.pdf)
-* [Dragonchain Architecture Document DRAFT for comment](https://docs.google.com/document/d/1SRhBUeGN1dpm9sZsxTrqEHx0qL3_R3DPg-fcMUhUKWs)
+* [Dragonchain Architecture Document](https://dragonchain.github.io/architecture) - [PDF](https://dragonchain.github.io/doc/DragonchainArchitecture.pdf)
+* [Use Cases](https://dragonchain.github.io/blockchain-use-cases)
+* [Disney Blockchain Standardization Notes](https://dragonchain.github.io/blockchain-standardization) - [W3C](https://github.com/w3c/blockchain/blob/master/standards.md)
 
 ## Support
 
@@ -38,6 +39,25 @@ Joe Roets (j03)
 joe@dragonchain.org
 
 # Setup and Installation
+
+### Running Stack via Docker
+Requires Docker version 1.13.0 and docker-compose version 1.10.0 
+
+Stack declaration is made via the docker-compose.yaml in the docker 
+directory. Docker-compose.yml uses the dockerfile declarations that packages the project services into containers.
+
+To bring up the stack:
+
+
+    cd docker
+    docker-compose up -d
+Postgres is exposed at port 5432
+
+Query service is exposed at port 80
+
+Transaction service is exposed at port 81
+
+Processor service is exposed at port 8080
 
 ### Database Setup
 
@@ -65,10 +85,23 @@ If you have Apache Thrift installed you can regenerate these classes by using th
 
 ### Keys
 
+    mkdir pki
+
 * Signing Key Generation `openssl ecparam -name secp224r1 -genkey -out <Dragonchain Home>/pki/sk.pem`
-* Verifying Key Generation `openssl ec -in sk.pem -pubout -out <Dragonchain Home>/pki/pk.pem`
+* Verifying Key Generation `openssl ec -in pki/sk.pem -pubout -out <Dragonchain Home>/pki/pk.pem`
+* **The signing key must be kept private.**  The pki directory is listed in .gitignore to prevent accidentally pushing keys to a public repository.
+
+### Logs
+
+Pre-create a directory for log files before execution.
+
+    mkdir logs
 
 # Execution
+
+## Set the PYTHONPATH variable
+    
+    export PYTHONPATH=/path/to/dragonchain
 
 ## Transaction Service
 
@@ -76,8 +109,13 @@ If you have Apache Thrift installed you can regenerate these classes by using th
     
 ## Query Service
 
-    python <Dragonchain Home>/blockchain/query_svc.py --private-key <Dragonchain Home>/pki/sk.pem --public-key <Dragonchain Home>/pki/pk.pem
+    python <Dragonchain Home>/blockchain/query_svc.py [-p port] //defaults to 8080
 
+### Example Query
+
+    localhost:8080/transaction/?create_ts=1475155787 //timestamp in Unix Epoch timecode
+        - create_ts can be replaced with any of the header fields in a transaction
+    
 ## Blockchain Processor
 
     python <Dragonchain Home>/blockchain/processing.py --private-key <Dragonchain Home>/pki/sk.pem --public-key <Dragonchain Home>/pki/pk.pem
@@ -87,6 +125,38 @@ If you have Apache Thrift installed you can regenerate these classes by using th
     --host        (defaults to localhost)
     --port, -p    (defaults to 8080)
     --phase       (required)
+    
+    For phase 5 node only:
+    --bitcoin-network (mainnet/testnet/regtest)
+    
+## Running a phase 5 node
+
+The current implementation of the phase 5 node can connect to a local bitcoin node with wallet in order to run or
+can remotely connect to another bitcoin wallet running Bitcoin-Qt. 
+Make sure that your bitcoin.conf file is in the proper location:
+    
+##### Mac OSX
+
+    $HOME/Library/Application Support/Bitcoin/
+    
+##### Linux
+
+    $HOME/.bitcoin/
+    
+##### Windows
+    
+    %APPDATA%\Bitcoin\
+    
+#### bitcoin.conf file contents
+    
+    rpcuser="some username"
+    rpcpassword="password for the node"
+    
+Optional for running on a remote node:
+    
+    rpcconnect="bitcoin_node_ip_address"
+    rpcport="bitcoin_node_port" (defaults to 8333)
+    
 
 ## Configuration
 
@@ -122,6 +192,7 @@ Code should follow the [PEP 8 Style Guide](https://www.python.org/dev/peps/pep-0
 - [Eileen Quenin - Product Manager / Evangelist](https://www.linkedin.com/in/eileenquenin)
 - [Brandon Kite - Lead Developer](https://www.linkedin.com/in/bkite)
 - [Dylan Yelton - Developer](https://www.linkedin.com/in/dylan-yelton-b11ba5aa)
+- [Alex Benedetto - Developer](https://www.linkedin.com/in/alex-benedetto-6175048b)
 - [Michael Bachtel - DevOps / Developer](https://www.linkedin.com/in/michael-bachtel-617b7b2)
 - [Lucas Ontivero - Developer](https://ar.linkedin.com/in/lucasontivero)
 - [Adam Bronfin - Developer / Reviewer](https://www.linkedin.com/in/adam-bronfin-694a7440)
@@ -134,11 +205,18 @@ Code should follow the [PEP 8 Style Guide](https://www.python.org/dev/peps/pep-0
 - [Paul Sonier - Developer / Reviewer](https://www.linkedin.com/in/paul-sonier-18135b2)
 - [Kevin Schumacher - Artist / Web Design](https://www.linkedin.com/in/schubox)
 - [Brian J Wilson - Architect](https://www.linkedin.com/in/brian-wilson-9325a776)
+- [Mike De'Shazer - Developer / Reviewer](https://kr.linkedin.com/in/mikedeshazer)
+- [Tai Kersten - Developer / Reviewer](https://kr.linkedin.com/in/tai-kersten-bb460412a/en)
 - Steve Owens - Reviewer
 - Mark LaPerriere - Reviewer
 - Kevin Duane - Reviewer
 - Chris Moore - Reviewer
 
+# Disclaimer
+
+The comments, views, and opinions expressed in this forum are those of the authors and do not necessarily reflect the official policy or position of the Walt Disney Company, Disney Connected and Advanced Technologies, or any affiliated companies.
+
+All code contained herein is provided “AS IS” without warranties of any kind. Any implied warranties of non-infringement, merchantability, and fitness for a particular purpose are expressly disclaimed by the author(s).
 
 # License
 

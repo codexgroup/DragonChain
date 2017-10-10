@@ -35,8 +35,7 @@ from psycopg2.extras import Json
 import uuid
 import time
 
-from blockchain.qry import format_transaction, \
-                           format_block_verification
+from blockchain.qry import format_transaction
 
 from postgres import get_connection_pool
 
@@ -44,6 +43,7 @@ from postgres import get_connection_pool
 DEFAULT_PAGE_SIZE = 1000
 """ SQL Queries """
 SQL_GET_BY_ID = """SELECT * FROM transactions WHERE transaction_id = %s"""
+# adding to test querying anything
 SQL_GET_ALL = """SELECT * FROM transactions"""
 SQL_INSERT = """INSERT into transactions (
                             transaction_id,
@@ -61,7 +61,12 @@ SQL_INSERT = """INSERT into transactions (
                             entity
                           ) VALUES  (%s, to_timestamp(%s), to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
 SQL_UPDATE = """UPDATE transactions SET status = %s, block_id = %s WHERE transaction_id = %s"""
-SQL_FIXATE_BLOCK = """UPDATE transactions SET status='pending', block_id=%i WHERE status = 'new' AND transaction_ts >= to_timestamp(%i) AND transaction_ts <= to_timestamp(%i)"""
+SQL_FIXATE_BLOCK = """UPDATE transactions
+                            SET status='pending',
+                            block_id=%s
+                            WHERE status = 'new' AND
+                            transaction_ts >= to_timestamp(%s) AND
+                            transaction_ts <= to_timestamp(%s)"""
 
 
 def get_cursor_name():
@@ -84,38 +89,118 @@ def get(txid):
 
 def get_all(limit=None, offset=None, **params):
     query = SQL_GET_ALL
-    multi_param = False
+    separator_needed = False
     if params:
-        query += """ WHERE """
+        query += """ WHERE"""
 
-    if "block_id" in params:
-        query += """ block_id = """ + str(params["block_id"])
-        multi_param = True
+    if "block_id" in params and params["block_id"]:
+        query += """ block_id = %(block_id)s"""
+        separator_needed = True
 
-    if "transaction_type" in params:
-        if multi_param:
+    if "transaction_type" in params and params["transaction_type"]:
+        if separator_needed:
             query += """ AND """
-        query += """ transaction_type = '""" + str(params["transaction_type"]) + """'"""
-        multi_param = True
+        query += """ transaction_type = %(transaction_type)s"""
+        separator_needed = True
 
-    if "owner" in params:
-        if multi_param:
+    if "business_unit" in params and params["business_unit"]:
+        if separator_needed:
             query += """ AND """
-        query += """ owner = '""" + str(params["owner"]) + """'"""
-        multi_param = True
+        query += """ business_unit = %(business_unit)s"""
+        separator_needed = True
 
-    if "actor" in params:
-        if multi_param:
+    if "family_of_business" in params and params["family_of_business"]:
+        if separator_needed:
             query += """ AND """
-        query += """ actor = '""" + str(params["actor"]) + """'"""
-        multi_param = True
+        query+= """ family_of_business = %(family_of_business)s"""
 
-    if "entity" in params:
-        if multi_param:
+    if "line_of_business" in params and params["line_of_business"]:
+        if separator_needed:
             query += """ AND """
-        query += """ entity = '""" + str(params["entity"]) + """'"""
-        multi_param = True
-        # not used but left in place to handle future params
+        query += """ line_of_business = %(line_of_business)s"""
+        separator_needed = True
+
+    if "signature" in params and params["signature"]:
+        if separator_needed:
+            query += """ AND """
+        query += """ signature = %(signature)s"""
+        separator_needed = True
+
+    if "status" in params and params["status"]:
+        if separator_needed:
+            query += """ AND """
+        query += """ status = %(status)s"""
+        separator_needed = True
+
+    if "owner" in params and params["owner"]:
+        if separator_needed:
+            query += """ AND """
+        query += """ owner = %(owner)s"""
+        separator_needed = True
+
+    if "actor" in params and params["actor"]:
+        if separator_needed:
+            query += """ AND """
+        query += """ actor = %(actor)s"""
+        separator_needed = True
+
+    if "entity" in params and params["entity"]:
+        if separator_needed:
+            query += """ AND"""
+        query += """ entity = %(entity)s"""
+        separator_needed = True
+
+    if "create_ts" in params:
+        if separator_needed:
+            query += """ AND"""
+        if '-' in params["create_ts"]:
+            # if it is timestamp >= UNIX-epoch timecode
+            if params["create_ts"].index('-') == 0:
+                start_time = time.strftime('%Y-%m-%d %H:%M:%S',time.gmtime(float(params["create_ts"][1:])))
+                params["start_time"] = start_time
+                query += """ create_ts >= %(start_time)s"""
+            elif params["create_ts"].endswith('-'):
+                end_time = time.strftime('%Y-%m-%d %H:%M:%S',time.gmtime(float(params["create_ts"][:len(params["create_ts"])-1])))
+                params["end_time"] = end_time
+                query += """ create_ts <= %(end_time)s"""
+            else:
+                start_time = time.strftime('%Y-%m-%d %H:%M:%S',time.gmtime(float(params["create_ts"][:params["create_ts"].index('-')])))
+                end_time = time.strftime('%Y-%m-%d %H:%M:%S',  time.gmtime(float(params["create_ts"][params["create_ts"].index('-')+1:])))
+                params["start_time"] = start_time
+                params["end_time"] = end_time
+                query += """ create_ts >= %(start_time)s AND create_ts <= %(end_time)s"""
+        else:
+            cur_time = time.strftime('%Y-%m-%d %H:%M:%S',  time.gmtime(float(params["create_ts"])))
+            params["cur_time"] = cur_time
+            query += """ create_ts = %(cur_time)s"""
+        separator_needed = True
+
+    if "transaction_ts" in params:
+        print("transaction_ts")
+        if separator_needed:
+            query += """ AND"""
+        if '-' in params["transaction_ts"]:
+            # if it is timestamp >= UNIX-epoch timecode
+            if params["transaction_ts"].index('-') == 0:
+                start_time = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(float(params["transaction_ts"][1:])))
+                params["start_time"] = start_time
+                query += """ transaction_ts >= %(start_time)s"""
+            elif params["transaction_ts"].endswith('-'):
+                end_time = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(float(params["create_ts"][:len(params["transaction_ts"]) - 1])))
+                params["end_time"] = end_time
+                query += """ transaction_ts <= %(end_time)s"""
+            else:
+                start_time = time.strftime('%Y-%m-%d %H:%M:%S',time.gmtime(float(params["create_ts"][:params["transaction_ts"].index('-')])))
+                end_time = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(float(params["transaction_ts"][params["create_ts"].index('-') + 1:])))
+                params["start_time"] = start_time
+                params["end_time"] = end_time
+                query += """ transaction_ts >= %(start_time)s AND transaction_ts <= %(end_time)s"""
+        else:
+            cur_time = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(float(params["transaction_ts"])))
+            params["cur_time"] = cur_time
+            query += """ transaction_ts = %(cur_time)s"""
+            separator_needed = True
+            # not used but left in place to handle future params
 
     query += """ ORDER BY transaction_ts DESC """
 
@@ -123,15 +208,67 @@ def get_all(limit=None, offset=None, **params):
         limit = 10
 
     if limit:
-        query += """ LIMIT """ + str(limit)
+        params["limit"] = limit
+        query += """ LIMIT %(limit)s"""
 
     if offset:
-        query += """ OFFSET """ + str(offset)
+        params["offset"] = offset
+        query += """ OFFSET $(offset)s"""
 
     conn = get_connection_pool().getconn()
     try:
         cur = conn.cursor(get_cursor_name(), cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute(query)
+        cur.execute(query, params)
+        'An iterator that uses fetchmany to keep memory usage down'
+        while True:
+            results = cur.fetchmany(DEFAULT_PAGE_SIZE)
+            if not results:
+                break
+            for result in results:
+                yield format_transaction(result)
+        cur.close()
+    finally:
+        get_connection_pool().putconn(conn)
+
+
+def get_subscription_txns(criteria, block_id=None):
+    """ retrieve transactions that meet given criteria and have a block_id >= minimum_block_id """
+    query = SQL_GET_ALL
+    query += """ WHERE """
+    separator_needed = False
+
+    if "transaction_type" in criteria:
+        query += """ transaction_type = %(transaction_type)s"""
+        separator_needed = True
+
+    if "actor" in criteria:
+        if separator_needed:
+            query += """ AND """
+        query += """ actor = %(actor)s"""
+        separator_needed = True
+
+    if "entity" in criteria:
+        if separator_needed:
+            query += """ AND """
+        query += """ entity = %(entity)s"""
+        separator_needed = True
+
+    if "owner" in criteria:
+        if separator_needed:
+            query += """ AND """
+        query += """ owner = %(owner)s"""
+        separator_needed = True
+
+    if block_id:
+        if separator_needed:
+            query += """ AND """
+        query += """ block_id = %(block_id)s"""
+        criteria['block_id'] = block_id  # adding for query execution vars
+
+    conn = get_connection_pool().getconn()
+    try:
+        cur = conn.cursor(get_cursor_name(), cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute(query, criteria)
         'An iterator that uses fetchmany to keep memory usage down'
         while True:
             results = cur.fetchmany(DEFAULT_PAGE_SIZE)
@@ -190,11 +327,10 @@ def update_transaction(txn):
 
 def fixate_block(start_ts_range, end_ts_range, block_id):
     # get all tx within the previous block
-    update_query = SQL_FIXATE_BLOCK % (block_id, start_ts_range, end_ts_range)
     conn = get_connection_pool().getconn()
     try:
         cur = conn.cursor()
-        cur.execute(update_query)
+        cur.execute(SQL_FIXATE_BLOCK, (block_id, start_ts_range, end_ts_range))
         conn.commit()
         cur.close()
     finally:

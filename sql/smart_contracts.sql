@@ -1,5 +1,6 @@
-"""
-Copyright 2016 Disney Connected and Advanced Technologies
+/*
+
+Copyright 2017, Dragonchain Foundation
 
 Licensed under the Apache License, Version 2.0 (the "Apache License")
 with the following modification; you may not use this file except in
@@ -20,26 +21,66 @@ distributed under the Apache License with the above modification is
 distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 KIND, either express or implied. See the Apache License for the specific
 language governing permissions and limitations under the Apache License.
-"""
 
 __author__ = "Joe Roets, Brandon Kite, Dylan Yelton, Michael Bachtel"
-__copyright__ = "Copyright 2016, Disney Connected and Advanced Technologies"
+__copyright__ = "Copyright 2017, Dragonchain Foundation"
 __license__ = "Apache"
 __version__ = "2.0"
 __maintainer__ = "Joe Roets"
 __email__ = "joe@dragonchain.org"
 
-
-""" only used for manually inserting data into nodes table """
-from blockchain.db.postgres import network_db as net_dao
-from blockchain.network import Node
-import os
+*/
 
 
-def load_required_nodes():
-    node = Node('6625e727-f5b8-45ab-87c7-d113192ce168', 'TWDC', 'localhost', '8083', '01000')
-    net_dao.insert_node(node)
-    print('inserted node into database ' + os.environ.get('BLOCKCHAIN_DB_NAME') + " " + node.node_id)
+/* Create a blocky user if it doesn't exist */
+do
+$body$
+declare
+  num_users integer;
+begin
+   SELECT count(*)
+     into num_users
+   FROM pg_user
+   WHERE usename = 'blocky';
 
-if __name__ == '__main__':
-    load_required_nodes()
+   IF num_users = 0 THEN
+      CREATE ROLE blocky WITH LOGIN;
+   END IF;
+end
+$body$
+;
+
+BEGIN;
+/* Don't drop tables unless you really want to */
+CREATE TABLE IF NOT EXISTS smart_contracts (
+    /* sc unique id */
+    sc_id UUID PRIMARY KEY,
+
+    /* type of sc (i.e. tsc, ssc, lsc, bsc, etc.) */
+    sc_class VARCHAR(256),
+
+    /* smart contract code */
+    smart_contract TEXT,
+
+    /* sc dictionary key */
+    sc_key VARCHAR(256),
+
+    /* criteria used for selection of appropriate sc */
+    criteria TEXT[],
+
+    /* unit test for sc */
+    test TEXT,
+
+    /* required libraries needed for the sc to run */
+    requirements TEXT[],
+
+    /* current sc version */
+    version INT,
+
+    /* sc status */
+    status sc_status
+);
+COMMIT;
+BEGIN;
+GRANT ALL ON smart_contracts to blocky;
+COMMIT;

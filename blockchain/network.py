@@ -42,14 +42,22 @@ import json
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from blockchain.db.postgres import network_db as net_dao
+from blockchain.db.postgres import vr_transfers_db
+from blockchain.db.postgres import verification_db
+
+from blockchain.db.postgres import sub_to_db
+from blockchain.db.postgres import sub_from_db
+from blockchain.db.postgres import transaction_db
+from blockchain.db.postgres import sub_vr_backlog_db as sub_vr_backlog_db
+from blockchain.db.postgres import sub_vr_transfers_db
 
 import gen.messaging.BlockchainService as BlockchainService
 import gen.messaging.ttypes as message_types
+import db.postgres.postgres as pg
 
-from blockchain.util.thrift_conversions import convert_to_thrift_transaction, \
-                                               get_verification_record, \
-                                               thrift_record_to_dict, \
-                                               thrift_transaction_to_dict
+from blockchain.util import thrift_conversions as thrift_converter
+
+from blockchain.util.crypto import validate_subscription
 
 from thrift import Thrift
 from thrift.transport import TSocket
@@ -65,10 +73,14 @@ sys.path.append('gen')
 
 
 DEFAULT_PORT = 9080
+
 NODE_ID_PROPERTY_KEY = 'node_id'
 OWNER_PROPERTY_KEY = 'owner'
 BUSINESS_PROPERTY_KEY = 'business'
 LOCATION_PROPERTY_KEY = 'deploy_location'
+PUB_TRANS_PROPERTY_KEY = 'public_transmission'
+VR_DB_LIMIT = 'vr_db_limit'
+TXN_DB_LIMIT = 'txn_db_limit'
 INBOUND_TIMEOUT = 30  # seconds
 
 RECORD = 'record'
@@ -81,12 +93,11 @@ PHASE_3_NODE = 0b00100
 PHASE_4_NODE = 0b01000
 PHASE_5_NODE = 0b10000
 
-DATABASE_NAME = os.environ.get('BLOCKCHAIN_DB_NAME')
+DATABASE_NAME = os.getenv(pg.ENV_DATABASE_NAME, pg.DEFAULT_DB_NAME)
 
 CONFIG_FILE = '../configs/' + DATABASE_NAME + '.yml'
 
 LOG_FILE = '../logs/' + DATABASE_NAME + '.log'
-open(LOG_FILE, 'w').close()  # reset log file
 
 
 def logger(name="network-manager"):
@@ -117,6 +128,7 @@ class Node(object):
         # TODO: enter as cmd line arg
         self.public_key = None
         self.proof = None
+        self.last_transfer_time = 0
 
     def __eq__(self, other):
             return hash(self.node_id) == hash(other.node_id)
@@ -134,13 +146,17 @@ class ConnectionManager(object):
         self.port = port
         self.business = None
         self.deploy_location = None
+        self.vr_db_limit = None
+        self.txn_db_limit = None
         # phase_type => {nodes} (dictionary of connected nodes)
         self.peer_dict = {}
         self.config = None
-        # list of connected nodes
+        # set of connected nodes
         self.connections = set()
         self.phases = int(phases)
         self.processing_node = processing_node
+        # defaults to 15 minutes (900 seconds)
+        self.receipt_request_time = 900
         """ Load configured nodelist """
         logger().info('loading network config...')
         self.load_config()
@@ -152,6 +168,8 @@ class ConnectionManager(object):
 
         # BLOCKING
         logger().info('Starting RMI service handler...')
+
+        # if testing network only without processing
         if processing_node is None:
             self.start_service_handler()
 
@@ -162,10 +180,22 @@ class ConnectionManager(object):
         self.business = self.config[BUSINESS_PROPERTY_KEY]
         self.deploy_location = self.config[LOCATION_PROPERTY_KEY]
 
+        if VR_DB_LIMIT in self.config:
+            self.vr_db_limit = self.config[VR_DB_LIMIT]
+
+        if TXN_DB_LIMIT in self.config:
+            self.txn_db_limit = self.config[TXN_DB_LIMIT]
+
+        # set public_transmission dictionary from yml config
+        if self.processing_node:
+            self.processing_node.public_transmission = self.config[PUB_TRANS_PROPERTY_KEY]
+
         self.this_node.host = self.host
         self.this_node.port = int(self.port)
         self.this_node.owner = self.config[OWNER_PROPERTY_KEY]
         self.this_node.node_id = self.config[NODE_ID_PROPERTY_KEY]
+        if "receipt_request_time" in self.config:
+            self.receipt_request_time = self.config["receipt_request_time"]
         self.this_node.phases = int(self.phases)
 
     def start_service_handler(self):
@@ -180,11 +210,19 @@ class ConnectionManager(object):
         logger().info('server started.')
 
     def schedule_tasks(self):
+        """ scheduled tasks that run every x seconds """
         scheduler = BackgroundScheduler()
 
         scheduler.add_job(self.refresh_registered, CronTrigger(second='*/5'))
         scheduler.add_job(self.refresh_unregistered, CronTrigger(second='*/60'))
         scheduler.add_job(self.connect, CronTrigger(second='*/5'))
+        scheduler.add_job(self.subscription_feed, CronTrigger(second='*/5'))
+
+        # the timed_receipt_request only is added to the chron for nodes that are transmitting up the chain.
+        if (self.this_node.phases & 0b00111 or
+           (self.this_node.phases & 0b01000 and self.config['public_transmission']['p4_pub_trans'])):
+            scheduler.add_job(self.timed_receipt_request, CronTrigger(second='*/300'))
+
         scheduler.start()
 
     def refresh_registered(self):
@@ -203,7 +241,7 @@ class ConnectionManager(object):
                         try:
                             net_dao.insert_node(converted_node)
                         except Exception as ex:  # likely trying to add a dupe node
-                            template = "An exception of type {0} occured. Arguments:\n{1!r}"
+                            template = "An exception of type {0} occurred. Arguments:\n{1!r}"
                             message = template.format(type(ex).__name__, ex.args)
                             # logger().warning(message)
                             continue
@@ -234,12 +272,12 @@ class ConnectionManager(object):
                 if self.phases & PHASE_4_NODE:
                     self.connect_nodes(PHASE_5_NODE)
         except Exception as ex:
-            template = "An exception of type {0} occured. Arguments:\n{1!r}"
+            template = "An exception of type {0} occurred. Arguments:\n{1!r}"
             message = template.format(type(ex).__name__, ex.args)
             logger().warning(message)
 
     def discover_node(self, node_to_discover):
-        """ discover node, get node info from unregistered nodes (updating unregistered nodes) """
+        """ discover node, get_verifications node info from unregistered nodes (updating unregistered nodes) """
         if self.connect_thrift_node(node_to_discover):
             logger().info('successfully connected to unregistered node port: %s', node_to_discover.port)
             try:  # if able to connect to unregistered node
@@ -256,7 +294,8 @@ class ConnectionManager(object):
         """ remove given node in any places it shows up in peer_dict """
         for phase_type in self.peer_dict.keys():
             if node_to_remove.phases & phase_type:
-                self.peer_dict[phase_type].remove(node_to_remove)
+                if node_to_remove in self.peer_dict[phase_type]:
+                    self.peer_dict[phase_type].remove(node_to_remove)
 
     def disconnect_node(self, node_to_remove):
         """ disconnects given node and removes from connected structures """
@@ -327,7 +366,7 @@ class ConnectionManager(object):
             try:
                 net_dao.update_failed_ping(node_to_calc)
             except Exception as ex:
-                template = "An exception of type {0} occured. Arguments:\n{1!r}"
+                template = "An exception of type {0} occurred. Arguments:\n{1!r}"
                 message = template.format(type(ex).__name__, ex.args)
                 logger().warning(message)
 
@@ -373,16 +412,16 @@ class ConnectionManager(object):
                         try:
                             net_dao.update_con_attempts(node_to_connect)  # incrementing connection attempts on fail
                         except Exception as ex:
-                            template = "An exception of type {0} occured. Arguments:\n{1!r}"
+                            template = "An exception of type {0} occurred. Arguments:\n{1!r}"
                             message = template.format(type(ex).__name__, ex.args)
                             logger().warning(message)
-                        transport.close
+                        transport.close()
                         print(node_to_connect.node_id + ' rejected outbound connection request.')
 
             except Exception as ex:
                 if not connection_successful:
                     net_dao.update_con_attempts(node_to_connect)
-                template = "An exception of type {0} occured. Arguments:\n{1!r}"
+                template = "An exception of type {0} occurred. Arguments:\n{1!r}"
                 message = template.format(type(ex).__name__, ex.args)
                 logger().warning(message)
             finally:
@@ -400,62 +439,283 @@ class ConnectionManager(object):
 
     def phase_1_broadcast(self, block_info, phase_type):
         """ sends phase_1 information for phase_2 execution """
-        record = block_info[VERIFICATION_RECORD]
-        transactions = map(convert_to_thrift_transaction, record[VERIFICATION_INFO])
-        verification_record = get_verification_record(record)
-
-        phase_1_msg = message_types.Phase_1_msg()
-        phase_1_msg.record = verification_record
-        phase_1_msg.transactions = transactions
+        phase_1_msg = thrift_converter.get_p1_message(block_info)
+        ver_ids = []
 
         for node in self.peer_dict[phase_type]:
             try:
-                node.client.phase_1_message(phase_1_msg)
-            except:
-                logger().warning('failed to submit to node %s', node.node_id)
-                continue
+                ver_ids += node.client.phase_1_message(phase_1_msg)
+                vrs = self.get_vrs(node, ver_ids)
+                record = message_types.VerificationRecord()
+                record.p1 = phase_1_msg
+                vrs.append(record)
+                self.resolve_data(vrs, 1)
+            except Exception as ex:
+                template = "An exception of type {0} occurred. Arguments:\n{1!r}"
+                message = template.format(type(ex).__name__, ex.args)
+                logger().warning(message)
+
 
     def phase_2_broadcast(self, block_info, phase_type):
         """ sends phase_2 information for phase_3 execution """
-        verification_record = block_info[VERIFICATION_RECORD]
-        verification_info = verification_record[VERIFICATION_INFO]
-
-        phase_2_msg = message_types.Phase_2_msg()
-        phase_2_msg.record = get_verification_record(verification_record)
-        phase_2_msg.valid_txs = map(convert_to_thrift_transaction, verification_info['valid_txs'])
-        phase_2_msg.invalid_txs = map(convert_to_thrift_transaction, verification_info['invalid_txs'])
-        phase_2_msg.business = verification_info['business']
-        phase_2_msg.deploy_location = verification_info['deploy_location']
+        phase_2_msg = thrift_converter.get_p2_message(block_info)
+        ver_ids = []
 
         for node in self.peer_dict[phase_type]:
             try:
-                node.client.phase_2_message(phase_2_msg)
+                ver_ids += node.client.phase_2_message(phase_2_msg)
+                vrs = self.get_vrs(node, ver_ids)
+                self.resolve_data(vrs, 2)
             except:
                 logger().warning('failed to submit to node %s', node.node_id)
                 continue
 
     def phase_3_broadcast(self, block_info, phase_type):
         """ send phase_3 information for phase_4 execution """
-        verification_record = block_info[VERIFICATION_RECORD]
-        verification_info = verification_record[VERIFICATION_INFO]
-
-        phase_3_msg = message_types.Phase_3_msg()
-        phase_3_msg.record = get_verification_record(verification_record)
-        phase_3_msg.p2_count = verification_info['p2_count']
-        phase_3_msg.business_list = verification_info['business_list']
-        phase_3_msg.deploy_loc_list = verification_info['deploy_location_list']
-        phase_3_msg.lower_phase_hashes = verification_info['lower_phase_hashes']
+        phase_3_msg = thrift_converter.get_p3_message(block_info)
+        ver_ids = []
 
         for node in self.peer_dict[phase_type]:
             try:
-                node.client.phase_3_message(phase_3_msg)
+                ver_ids += node.client.phase_3_message(phase_3_msg)
+                vrs = self.get_vrs(node, ver_ids)
+                self.resolve_data(vrs, 3)
             except:
                 logger().warning('failed to submit to node %s', node.node_id)
                 continue
 
-    # TODO: implement this broadcast
     def phase_4_broadcast(self, block_info, phase_type):
-        pass
+        """ send phase_4 information for phase_5 execution """
+        ver_ids = []
+
+        verification_record = block_info['verification_record']
+        verification_info = verification_record['verification_info']
+
+        phase_4_msg = message_types.Phase_4_msg()
+        phase_4_msg.record = thrift_converter.convert_to_thrift_record(verification_record)
+        phase_4_msg.lower_hash = verification_info
+
+        for node in self.peer_dict[phase_type]:
+            try:
+                ver_ids += node.client.phase_4_message(phase_4_msg)
+                vrs = self.get_vrs(node, ver_ids)
+                self.resolve_data(vrs, 4)
+            except:
+                logger().warning('failed to submit to node %s', node.node_id)
+                continue
+
+    def timed_receipt_request(self):
+        """ time based receipt request """
+        for node in self.connections:
+            if int(time.time()) - node.last_transfer_time >= self.receipt_request_time:
+                ver_ids = node.client.receipt_request(node.pass_phrase)
+                vrs = self.get_vrs(node, ver_ids)  # verifications matching given verification ids
+                self.resolve_data(vrs, node.phases)  # node.phases may present problems since it's in binary
+
+    def subscription_feed(self):
+        """ request transactions with associated verification records from subscription """
+        subscriptions = sub_to_db.get_all()
+        for subscription in subscriptions:
+            subscription_node = self.get_subscription_node(subscription)
+            if subscription_node:
+                # sign subscription
+                self.processing_node.get_subscription_signature(subscription)
+                subscription_id = subscription['subscription_id']
+                # convert to thrift signature for sending to server
+                subscription_signature = thrift_converter.convert_to_thrift_signature(subscription['signature'])
+                # subscription already approved, request data from server
+                if subscription['status'] == "approved":
+                    subscription_response = subscription_node.client.subscription_request(subscription_id, subscription_signature)
+                    txns = map(thrift_converter.convert_thrift_transaction, subscription_response.transactions)
+                    vrs = map(thrift_converter.convert_thrift_verification, subscription_response.verification_records)
+                    self.insert_transactions(txns)
+                    self.insert_verifications(vrs)
+                    if txns or vrs:
+                        min_block_id = self.get_min_block_id(vrs)
+                        # execute any present subscription smart contracts
+                        self.processing_node.sch.execute_ssc(min_block_id, self.vr_db_limit, self.txn_db_limit)
+                elif subscription['status'] == "pending":
+                    logger().warning("Subscription[sub_id:%s][node_id:%s][node_owner:%s] still in pending status... Waiting for admin(s) approval.",
+                                     subscription['subscription_id'], subscription['subscribed_node_id'], subscription['node_owner'])
+
+    def get_subscription_node(self, subscription):
+        """ check if client is connected to node subscribed to and return that node. if not, attempt to connect to it and return. """
+        if not self.subscription_connected(subscription):
+            self.connect_subscription_node(subscription)
+        for node in self.connections:
+            if subscription["subscribed_node_id"] == node.node_id:
+                return node
+        return None
+
+    def subscription_connected(self, subscription):
+        """ check if connected to subscription node """
+        for node in self.connections:
+            if subscription["subscribed_node_id"] == node.node_id:
+                return True
+        return False
+
+    def connect_subscription_node(self, subscription):
+        """ connect to subscription node """
+        node = net_dao.get(subscription["subscribed_node_id"])
+        # check if node is already in database and just not connected
+        if node:
+            subscription_node = Node(node["node_id"], node["node_owner"], node["host"], node["port"], node["phases"])
+            phase = int(node["phases"], 2)
+            if phase not in self.peer_dict:
+                self.peer_dict.setdefault(phase, [])
+            try:
+                self.connect_node(subscription_node, phase)
+            except:
+                logger().warning("Failed to connect to subscription node %s", node['node_id'])
+        else:
+            # insert new node into table and recursively call connect_subscription_node
+            node = Node(subscription['subscribed_node_id'], subscription['node_owner'], subscription['host'], subscription['port'], "00001")
+            net_dao.insert_node(node)
+            self.connect_subscription_node(subscription)
+
+    def insert_transactions(self, transactions):
+        """ insert given transactions into database """
+        for txn in transactions:
+            try:
+                transaction_db.insert_transaction(txn)
+            except Exception as ex:
+                template = "An exception of type {0} occurred. Arguments:\n{1!r}"
+                message = template.format(type(ex).__name__, ex.args)
+                logger().error(message)
+                continue
+
+    def insert_verifications(self, verification_records):
+        """ insert given verification records in database """
+        for ver in verification_records:
+            try:
+                verification_db.insert_verification(ver, ver['verification_id'])
+            except Exception as ex:
+                template = "An exception of type {0} occurred. Arguments:\n{1!r}"
+                message = template.format(type(ex).__name__, ex.args)
+                logger().error(message)
+                continue
+
+    def get_min_block_id(self, vrs):
+        """ return minimum block id of given verification records """
+        return min(v['block_id'] for v in vrs)
+
+    def resolve_data(self, verifications, phase):
+        """ store received verifications from node, find replications and store them in transfers table """
+        for verification in verifications:
+            try:
+                verification = thrift_converter.convert_thrift_verification(verification)
+                if verification['signature']['signatory'] is not self.this_node.node_id:
+                    # run broadcast smart contract (BSC)
+                    self.processing_node.sch.execute_bsc(phase, verification)
+                    verification_db.insert_verification(verification, verification['verification_id'])
+                    # check if there are nodes further down the chain interested in this record
+                    replicated_verifications = verification_db.get_all_replication(verification['block_id'], phase, verification['origin_id'])
+                    for replicated_ver in replicated_verifications:
+                        vr_transfers_db.insert_transfer(replicated_ver['origin_id'], replicated_ver['signature']['signatory'], verification['verification_id'])
+                    # check if there are active subscriptions interested in this record
+                    self.update_subscription_response(verification)
+            except Exception as ex:
+                template = "An exception of type {0} occurred. Arguments:\n{1!r}"
+                message = template.format(type(ex).__name__, ex.args)
+                logger().warning(message)
+
+    def get_vrs(self, node, guids):
+        """ request unreceived verifications from node, notify node of already received verifications """
+        received, unreceived = self.split_items(lambda guid: verification_db.get(guid) is not None, guids)
+        verifications = node.client.transfer_data(node.pass_phrase, received, unreceived)
+        node.last_transfer_time = int(time.time())
+
+        return verifications
+
+    def update_subscription_response(self, verification_record):
+        """ check sub_vr_backlog, check if there are any active subscriptions that have phase criteria
+            that match given vr phase. if so, build a response of transactions and matching vrs for this block. """
+        server_id = self.this_node.node_id
+        block_id = verification_record['block_id']
+        backlogs = sub_vr_backlog_db.get_backlogs(block_id)
+        # check for backlogged records and insert for transfer
+        for bl in backlogs:
+            sub_vr_transfers_db.insert_transfer(bl['client_id'], [], [verification_record])
+        # subscriptions with phase criteria that meet given record's phase
+        subscriptions = sub_from_db.get_by_phase_criteria(verification_record['phase'])
+        for sub in subscriptions:
+            criteria = sub['criteria']
+            # transactions that meet subscription criteria
+            transactions = self.get_subscription_txns(criteria, block_id)
+            # verification records associated with transactions
+            verification_records = []
+            for txn in transactions:
+                verification_records += self.get_subscription_vrs(txn, server_id)
+            # insert new response for subscriber with transactions and vrs
+            if transactions or verification_records:
+                sub_vr_transfers_db.insert_transfer(sub['subscriber_id'], transactions, verification_records)
+            # create backlog for potentially delayed verifications
+            sub_vr_backlog_db.insert_backlog(sub['subscriber_id'], block_id)
+
+    def get_subscription_txns(self, criteria, block_id):
+        """ retrieve transactions that meet subscription criteria """
+        transactions = transaction_db.get_subscription_txns(criteria, block_id)
+        return list(transactions)
+
+    def get_subscription_vrs(self, transaction, server_id):
+        """ retrieve records for the block matching the given transaction with origin ids matching the server's id. """
+        txn_header = transaction["header"]
+        verifications_records = []
+        if "block_id" in txn_header and txn_header['block_id']:
+            verifications_records = verification_db.get_records(block_id=txn_header['block_id'], origin_id=server_id)
+        return verifications_records
+
+    @staticmethod
+    def split_items(filter_func, items):
+        accepted = []
+        rejected = []
+        for item in items:
+            if filter_func(item):
+                accepted += [item]
+            else:
+                rejected += [item]
+        return accepted, rejected
+
+    def public_broadcast(self, block_info, phase):
+        """ broadcast to phase 5 nodes for public transmission """
+        if block_info and phase <= PHASE_5_NODE:
+            # being asked for public broadcast, connect to known phase 5 nodes at this point
+            try:
+                if self.phases:
+                    self.connect_nodes(PHASE_5_NODE)
+            except Exception as ex:
+                template = "An exception of type {0} occurred. Arguments:\n{1!r}"
+                message = template.format(type(ex).__name__, ex.args)
+                logger().warning(message)
+
+            phase_msg = None
+            verification_record = message_types.VerificationRecord()
+            phase_5_request = message_types.Phase_5_request()
+
+            if phase == 1:
+                phase_msg = thrift_converter.get_p1_message(block_info)
+                verification_record.p1 = phase_msg
+            elif phase == 2:
+                phase_msg = thrift_converter.get_p2_message(block_info)
+                verification_record.p2 = phase_msg
+            elif phase == 3:
+                phase_msg = thrift_converter.get_p3_message(block_info)
+                verification_record.p3 = phase_msg
+            elif phase == 4:
+                phase_msg = thrift_converter.get_p4_message(block_info)
+                verification_record.p4 = phase_msg
+
+            phase_5_request.verification_record = verification_record
+
+            # send block to all known phase 5 nodes
+            if phase_msg:
+                for node in self.peer_dict[PHASE_5_NODE]:
+                    try:
+                        node.client.phase_5_message(phase_5_request)
+                        logger().info('block sent for public transmission...')
+                    except:
+                        logger().warning('failed to submit to node %s', node.node_id)
+                        continue
 
 
 class BlockchainServiceHandler:
@@ -484,11 +744,12 @@ class BlockchainServiceHandler:
 
     def remove_inbound_connection(self, pass_phrase):
         node = None
-        if pass_phrase in self.registered_nodes:
-            node = self.registered_node_health.pop(pass_phrase)
-            del self.registered_nodes[pass_phrase]
-            self.incoming_connections -= 1
-        return node
+        if pass_phrase:
+            if pass_phrase in self.registered_nodes:
+                node = self.registered_node_health.pop(pass_phrase)
+                del self.registered_nodes[pass_phrase]
+                self.incoming_connections -= 1
+            return node
 
     def authorize_pass_phrase(self, pass_phrase):
         if pass_phrase not in self.registered_nodes:
@@ -500,20 +761,22 @@ class BlockchainServiceHandler:
         return True
 
     def register_node(self, node_to_register, pass_phrase):
+        """ register(store) node connecting to this node """
         logger().info('a node is attempting to register')
         connection_authorized = False
-        if self.incoming_connections < self.connection_manager.max_inbound_connections:
+        if pass_phrase and self.incoming_connections < self.connection_manager.max_inbound_connections:
             # TODO: add more authorization logic here in the future
-            self.registered_nodes[pass_phrase] = [node_to_register]
+            self.registered_nodes[pass_phrase] = node_to_register
             connection_authorized = True
             self.incoming_connections += 1
             logger().info('accepted inbound connection from %s', node_to_register.node_id)
 
         return connection_authorized
 
-    def unregister_node(self):
-        node = self.remove_inbound_connection()
-        logger().info('%s severed inbound connection', node.node_id)
+    def unregister_node(self, pass_phrase):
+        if pass_phrase:
+            node = self.remove_inbound_connection(pass_phrase)
+            logger().info('%s severed inbound connection', node.node_id)
 
     def get_node_info(self):
         return self.connection_manager.this_node
@@ -524,41 +787,41 @@ class BlockchainServiceHandler:
 
     def phase_1_message(self, phase_1):
         """ submit phase_1 block for phase_2 validation_phase """
-        phase_1_info = {
-            RECORD: thrift_record_to_dict(phase_1.record),
-            VERIFICATION_INFO: map(thrift_transaction_to_dict, phase_1.transactions)
-        }
+        phase_1_info = thrift_converter.get_phase_1_info(phase_1)
         self.connection_manager.processing_node.notify(2, phase_1_info=phase_1_info)
+        return self.get_unsent_transfer_ids(transfer_to=phase_1_info[RECORD]['signature']['signatory'])
 
     def phase_2_message(self, phase_2):
-        phase_2_info = {
-            RECORD: thrift_record_to_dict(phase_2.record),
-            VERIFICATION_INFO: {
-                'valid_txs': map(thrift_transaction_to_dict, phase_2.valid_txs),
-                'invalid_txs': map(thrift_transaction_to_dict, phase_2.invalid_txs),
-                'business': phase_2.business,
-                'deploy_location': phase_2.deploy_location
-            }
-        }
+        phase_2_info = thrift_converter.get_phase_2_info(phase_2)
         self.connection_manager.processing_node.notify(3, phase_2_info=phase_2_info)
+        return self.get_unsent_transfer_ids(transfer_to=phase_2_info[RECORD]['signature']['signatory'])
 
     def phase_3_message(self, phase_3):
-        phase_3_info = {
-            RECORD: thrift_record_to_dict(phase_3.record),
-            VERIFICATION_INFO: {
-                'lower_phase_hashes': phase_3.lower_phase_hashes,
-                'p2_count': phase_3.p2_count,
-                'business_list': phase_3.business_list,
-                'deploy_location_list': phase_3.deploy_loc_list
-            }
-        }
+        phase_3_info = thrift_converter.get_phase_3_info(phase_3)
         self.connection_manager.processing_node.notify(4, phase_3_info=phase_3_info)
+        return self.get_unsent_transfer_ids(transfer_to=phase_3_info[RECORD]['signature']['signatory'])
 
     def phase_4_message(self, phase_4):
-        self.connection_manager.processing_node.notify(5, phase_4_info=phase_4)
+        phase_4_info = thrift_converter.get_phase_4_info(phase_4)
+        return self.get_unsent_transfer_ids(transfer_to=phase_4_info[RECORD]['signature']['signatory'])
 
     def phase_5_message(self, phase_5):
-        self.connection_manager.processing_node.notify(None, phase_5_info=phase_5)
+        """ determine which phase type being dealt with, convert thrift to dictionary
+            and send off for phase 5 (public transmission)
+        """
+        phase_info = None
+        if phase_5.verification_record.p1:
+            phase_info = thrift_converter.get_phase_1_info(phase_5.verification_record.p1)
+        elif phase_5.verification_record.p2:
+            phase_info = thrift_converter.get_phase_2_info(phase_5.verification_record.p2)
+        elif phase_5.verification_record.p3:
+            phase_info = thrift_converter.get_phase_3_info(phase_5.verification_record.p3)
+        elif phase_5.verification_record.p4:
+            phase_info = thrift_converter.get_phase_4_info(phase_5.verification_record.p4)
+
+        self.connection_manager.processing_node.notify(5, verification=phase_info)
+
+        return []
 
     def get_peers(self):
         """ return list of connections from this node """
@@ -572,6 +835,82 @@ class BlockchainServiceHandler:
             return node
 
         return map(create_node_from_peer, self.connection_manager.connections)
+
+    def transfer_data(self, pass_phrase, received, unreceived):
+        """ mark verifications as sent and return unsent verifications """
+        if pass_phrase:
+            self.authorize_pass_phrase(pass_phrase)
+            transfer_node = self.registered_nodes[pass_phrase]
+            verifications = []
+            guids = received + unreceived
+
+            # mark all verifications received as sent
+            for guid in guids:
+                vr_transfers_db.set_verification_sent(transfer_node.node_id, guid)
+
+            # retrieve unreceived records
+            for guid in unreceived:
+                verifications.append(verification_db.get(guid))
+
+            # format verifications to list of thrift structs for returning
+            thrift_verifications = map(thrift_converter.get_verification_type, verifications)
+
+            return thrift_verifications
+
+    def receipt_request(self, pass_phrase):
+        """ return unsent transfer ids to calling node """
+        if pass_phrase:
+            self.authorize_pass_phrase(pass_phrase)
+            transfer_node = self.registered_nodes[pass_phrase]
+            return self.get_unsent_transfer_ids(transfer_node.node_id)
+
+    def subscription_provisioning(self, subscription_id, criteria, phase_criteria, create_ts, public_key):
+        """ initial communication between subscription """
+        try:
+            sub_from_db.insert_subscription(subscription_id, criteria, phase_criteria, public_key, create_ts)
+        except:
+            logger().warning("A subscription SQL error has occurred.")
+        pass
+
+    def subscription_request(self, subscription_id, subscription_signature):
+        """ return transactions and associated verification records that meet criteria made by client """
+        transactions = []
+        verification_records = []
+        subscriber_info = sub_from_db.get(subscription_id)
+        # convert thrift signature to dictionary
+        subscriber_signature = thrift_converter.convert_thrift_signature(subscription_signature)
+        criteria = subscriber_info['criteria']
+        public_key = subscriber_signature["public_key"]
+        # validate subscription signature
+        if validate_subscription(subscriber_signature, criteria, subscriber_info['create_ts'], public_key):
+            # query transactions/vrs ready to send to calling subscription node
+            try:
+                subscription_messages = list(sub_vr_transfers_db.get_all(subscriber_info['subscriber_id']))
+                for message in subscription_messages:
+                    transactions += map(thrift_converter.convert_to_thrift_transaction, message['transactions'])
+                    verification_records += map(thrift_converter.get_verification_type, message['verifications'])
+
+                # convert to thrift friendly response
+                subscription_response = message_types.SubscriptionResponse()
+                subscription_response.transactions = transactions
+                subscription_response.verification_records = verification_records
+                return subscription_response
+            except Exception as ex:
+                template = "An exception of type {0} occurred. Arguments:\n{1!r}"
+                message = template.format(type(ex).__name__, ex.args)
+                logger().warning(message)
+
+    def get_unsent_transfer_ids(self, transfer_to):
+        """ retrieve unsent transfer record info (data used for querying block_verification database) """
+        unsent_transfer_ids = []
+        try:
+            logger().info("Retrieving unsent transfer ids...")
+            for transfer_record in vr_transfers_db.get_unsent_verification_records(transfer_to):
+                unsent_transfer_ids.append(transfer_record['verification_id'])
+        except:
+            logger().warning("An SQL error has occurred.")
+
+        return unsent_transfer_ids
 
 if __name__ == '__main__':
     net_dao.reset_data()

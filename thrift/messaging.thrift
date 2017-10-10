@@ -48,7 +48,7 @@ struct PriorBlockHash {
 
 struct Verification {
     1: string verification_id,
-    2: string verified_ts,
+    2: string verification_ts,
     3: i32 block_id,
     4: VerificationSignature signature,
     5: string owner,
@@ -115,9 +115,11 @@ struct VerificationRecordCommonInfo {
     2: string origin_id,
     3: i32 phase,
     4: i32 verification_ts,
-    5: Signature signature,
-    6: string prior_hash,
-    7: string lower_phase_hash
+    5: string verification_id,
+    6: Signature signature,
+    7: string prior_hash,
+    8: string lower_hash,
+    9: map<string, bool> public_transmission
 }
 
 struct Phase_1_msg {
@@ -133,26 +135,33 @@ struct Phase_2_msg {
     5: string deploy_location
 }
 
-/* TODO: rename business_list and deploy_loc_list to businesses and deploy_locations respectively */
 struct Phase_3_msg {
     1: VerificationRecordCommonInfo record,
-    2: list<string> lower_phase_hashes,
+    2: list<string> lower_hashes,
     3: i32 p2_count,
-    4: list<string> business_list,
-    5: list<string> deploy_loc_list
+    4: list<string> businesses,
+    5: list<string> deploy_locations
 }
 
 struct Phase_4_msg {
-    1: VerificationRecordCommonInfo record
+    1: VerificationRecordCommonInfo record,
+    2: string lower_hash
 }
 
-union Phase_5_msg {
-    1: Transaction transaction,
-    2: VerificationRecordCommonInfo record,
-    /* Level 5 node will NOT hash this field */
-    3: string hash,
-    /* Level 5 node WILL hash this field */
-    4: string misc
+union VerificationRecord {
+    1: Phase_1_msg p1,
+    2: Phase_2_msg p2,
+    3: Phase_3_msg p3,
+    4: Phase_4_msg p4
+}
+
+union Phase_5_request {
+    1: VerificationRecord verification_record
+}
+
+struct SubscriptionResponse {
+    1: list<Transaction> transactions,
+    2: list<VerificationRecord> verification_records
 }
 
 exception UnauthorizedException {
@@ -170,17 +179,25 @@ service BlockchainService {
 
    oneway void unregister_node(1: string pass_phrase),
 
-   void phase_1_message(1: Phase_1_msg p1),
+   list<string> phase_1_message(1: Phase_1_msg p1),
 
-   void phase_2_message(1: Phase_2_msg p2),
+   list<string> phase_2_message(1: Phase_2_msg p2),
 
-   void phase_3_message(1: Phase_3_msg p3),
+   list<string> phase_3_message(1: Phase_3_msg p3),
 
    /* external partner notary phase */
-   void phase_4_message(1: Phase_4_msg p4),
+   list<string> phase_4_message(1: Phase_4_msg p4),
 
    /* public, Bitcoin bridge phase */
-   void phase_5_message(1: Phase_5_msg p5),
+   list<string> phase_5_message(1: Phase_5_msg p5),
+
+   list<string> receipt_request(1: string pass_phrase),
+
+   list<VerificationRecord> transfer_data(1: string pass_phrase, 2: list<string> received, 3: list<string> unreceived),
+
+   void subscription_provisioning(1: string subscription_id, 2: map<string, string> criteria, 3:string phase_criteria, 4: i32 create_ts, 5: string public_key),
+
+   SubscriptionResponse subscription_request(1: string subscription_id, 2: Signature subscription_signature),
 
    list<Node> get_peers() throws (1:UnauthorizedException unauthorized)
 }
